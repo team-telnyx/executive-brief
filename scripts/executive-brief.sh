@@ -95,6 +95,34 @@ echo "   Days: $DAYS | Sections: $SECTIONS | Format: $OUTPUT_FORMAT" >&2
 [[ "$DRY_RUN" == "true" ]] && echo "   🧪 DRY RUN MODE — no external calls" >&2
 echo "" >&2
 
+# --- Read Slack config ---
+SLACK_CHANNEL=$(jq -r '.slack.channel // empty' "$CONFIG_PATH" 2>/dev/null || true)
+
+# --- Extract helpers (same pattern as EOM Credit Check) ---
+# Usage: extract_number "response text" "keyword1|keyword2"
+extract_number() {
+  local text="$1" pattern="$2"
+  echo "$text" | grep -ioE "${pattern}[^0-9\$-]{0,20}[-\$]{0,2}[0-9,]+\.?[0-9]*" | head -1 | \
+    grep -oE '[-]?\$?[0-9,]+\.?[0-9]*' | tail -1 | tr -d '$,' || echo ""
+}
+
+extract_bool() {
+  local text="$1" pattern="$2"
+  local snippet
+  snippet=$(echo "$text" | grep -ioE "${pattern}[^.]{0,40}" | head -1 || echo "")
+  if echo "$snippet" | grep -iqE '(yes|true|enabled|active|has auto|with auto)'; then
+    echo "true"
+  elif echo "$snippet" | grep -iqE '(no|false|disabled|inactive|no auto|without auto)'; then
+    echo "false"
+  else
+    if echo "$text" | grep -iqE "(${pattern}).{0,20}(yes|true|enabled|active)"; then
+      echo "true"
+    else
+      echo "false"
+    fi
+  fi
+}
+
 # --- Retry wrapper ---
 retry_curl() {
   local attempt=1 max=3 delay=2
@@ -155,12 +183,28 @@ tableau_auth() {
 fetch_tableau_revenue() {
   local customer_name="$1"
   local encoded_name
-  encoded_name=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$customer_name'))" 2>/dev/null || echo "$customer_name")
+  encoded_name=$(jq -rn --arg s "$customer_name" '$s | @uri')
 
-  local response
-  response=$(retry_curl \
+  local response http_code output
+  output=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" \
     "https://${TABLEAU_SERVER}/api/${TABLEAU_API}/sites/${TABLEAU_SITE_ID}/views/${TABLEAU_VIEW_ID}/data?vf_Account+Name=${encoded_name}" \
-    -H "X-Tableau-Auth: ${TABLEAU_TOKEN}") || return 1
+    -H "X-Tableau-Auth: ${TABLEAU_TOKEN}" 2>/dev/null) || true
+  http_code=$(echo "$output" | tail -1)
+  response=$(echo "$output" | sed '$d')
+
+  # Re-auth on 401 and retry once
+  if [[ "$http_code" == "401" ]]; then
+    echo "  🔄 Tableau 401 — re-authenticating..." >&2
+    if tableau_auth; then
+      response=$(retry_curl \
+        "https://${TABLEAU_SERVER}/api/${TABLEAU_API}/sites/${TABLEAU_SITE_ID}/views/${TABLEAU_VIEW_ID}/data?vf_Account+Name=${encoded_name}" \
+        -H "X-Tableau-Auth: ${TABLEAU_TOKEN}") || return 1
+    else
+      return 1
+    fi
+  elif [[ ! "$http_code" =~ ^2 ]]; then
+    return 1
+  fi
 
   echo "$response"
 }
@@ -211,11 +255,18 @@ fetch_zendesk_tickets() {
     return 1
   fi
 
-  local response
-  response=$(retry_curl -u "${ZD_EMAIL}/token:${ZD_TOKEN}" \
-    "https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/search.json?query=type:ticket+organization:${org}+created>${since_date}") || { echo ""; return 1; }
+  local all_results="[]"
+  local url="https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/search.json?per_page=100&query=type:ticket+organization:${org}+created>${since_date}"
 
-  echo "$response"
+  while [[ -n "$url" && "$url" != "null" ]]; do
+    local response
+    response=$(retry_curl -u "${ZD_EMAIL}/token:${ZD_TOKEN}" "$url") || { echo ""; return 1; }
+    all_results=$(jq -s '.[0] + (.[1].results // [])' <(echo "$all_results") <(echo "$response"))
+    url=$(echo "$response" | jq -r '.next_page // empty' 2>/dev/null || echo "")
+  done
+
+  # Wrap results back in expected format
+  jq -n --argjson results "$all_results" '{results: $results, count: ($results | length)}'
 }
 
 # --- Process each customer ---
@@ -226,6 +277,8 @@ TABLEAU_AVAILABLE=false
 if [[ "$DRY_RUN" != "true" ]]; then
   tableau_auth && TABLEAU_AVAILABLE=true
 fi
+
+CUSTOMERS_PROCESSED=0
 
 for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
   name=$(jq -r ".customers[$i].name" "$CONFIG_PATH")
@@ -239,6 +292,12 @@ for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
   fi
 
   echo "━━━ Processing: $name ($org_id) ━━━" >&2
+
+  # Tableau token re-auth: every 5 customers
+  if [[ "$DRY_RUN" != "true" && "$TABLEAU_AVAILABLE" == "true" && $CUSTOMERS_PROCESSED -gt 0 && $((CUSTOMERS_PROCESSED % 5)) -eq 0 ]]; then
+    echo "  🔄 Re-authenticating Tableau (every 5 customers)..." >&2
+    tableau_auth || TABLEAU_AVAILABLE=false
+  fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "  🧪 Dry run — skipping data fetch for $name" >&2
@@ -299,14 +358,50 @@ EOF
     fi
   fi
 
-  # 4. Billing A2A for balance/credit/MRC
-  echo "  💰 Fetching billing summary from A2A..." >&2
-  billing_data=$(a2a_query "For org $org_id, provide: current_balance, credit_limit, current_month_usage, next_month_mrc, daily_run_rate, has_autorecharge_enabled, payment_method, contract_end_date. Return as JSON.")
-  if [[ -n "$billing_data" ]]; then
-    echo "  ✅ Billing data received" >&2
-  else
-    echo "  ⚠️  No billing data available" >&2
-  fi
+  # 4. Billing A2A — split into 3 simple queries
+  echo "  💰 Fetching billing data from A2A (3 queries)..." >&2
+
+  # Query 1: Balance, credit limit, payment method
+  echo "    Q1: balance/credit/payment..." >&2
+  q1_text=$(a2a_query "What is the current balance, credit limit, and payment method for org ${org_id}?")
+  current_balance=$(extract_number "$q1_text" "balance")
+  credit_limit=$(extract_number "$q1_text" "credit.limit")
+  payment_method=$(echo "$q1_text" | grep -ioE '(credit.card|wire|ach|paypal|invoice|prepaid)' | head -1 || echo "unknown")
+
+  # Query 2: Usage, MRC, daily run rate
+  echo "    Q2: usage/MRC/run rate..." >&2
+  q2_text=$(a2a_query "What is the current month usage, MRC, and daily run rate for org ${org_id}?")
+  current_month_usage=$(extract_number "$q2_text" "usage|total.usage")
+  next_month_mrc=$(extract_number "$q2_text" "mrc|monthly.recurring|recurring.charge")
+  daily_run_rate=$(extract_number "$q2_text" "daily|run.rate")
+
+  # Query 3: Auto-recharge, contract end
+  echo "    Q3: auto-recharge/contract..." >&2
+  q3_text=$(a2a_query "Does org ${org_id} have auto-recharge enabled? What is the contract end date?")
+  has_autorecharge=$(extract_bool "$q3_text" "auto.?recharge")
+  contract_end=$(echo "$q3_text" | grep -ioE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1 || echo "")
+
+  # Assemble billing_data as JSON
+  billing_data=$(jq -n \
+    --arg balance "$current_balance" \
+    --arg credit_limit "$credit_limit" \
+    --arg payment_method "$payment_method" \
+    --arg usage "$current_month_usage" \
+    --arg mrc "$next_month_mrc" \
+    --arg daily_rate "$daily_run_rate" \
+    --arg autorecharge "$has_autorecharge" \
+    --arg contract_end "$contract_end" \
+    '{
+      current_balance: $balance,
+      credit_limit: $credit_limit,
+      payment_method: $payment_method,
+      current_month_usage: $usage,
+      next_month_mrc: $mrc,
+      daily_run_rate: $daily_rate,
+      has_autorecharge: ($autorecharge == "true"),
+      contract_end_date: $contract_end
+    }')
+  echo "  ✅ Billing data received" >&2
 
   # 5. Build data JSON for narrative generator
   data_json=$(jq -n \
@@ -338,6 +433,7 @@ EOF
 
   all_briefs="${all_briefs}${brief}\n"
   echo "  ✅ Brief generated for $name" >&2
+  CUSTOMERS_PROCESSED=$((CUSTOMERS_PROCESSED + 1))
 done
 
 # --- Output ---
@@ -349,4 +445,22 @@ if [[ -n "$OUTPUT_FILE" ]]; then
 fi
 
 echo "$output_text"
+
+# --- Post to Slack ---
+if [[ -n "$SLACK_CHANNEL" && -n "${SLACK_BOT_TOKEN:-}" && "$DRY_RUN" != "true" ]]; then
+  echo "📨 Posting brief to Slack channel $SLACK_CHANNEL..." >&2
+  slack_response=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+    -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg channel "$SLACK_CHANNEL" --arg text "$output_text" \
+      '{channel: $channel, text: $text, unfurl_links: false}')")
+  if echo "$slack_response" | jq -e '.ok == true' &>/dev/null; then
+    echo "  ✅ Brief posted to Slack" >&2
+  else
+    echo "  ⚠️  Slack post failed: $(echo "$slack_response" | jq -r '.error // "unknown"')" >&2
+  fi
+elif [[ -n "$SLACK_CHANNEL" && -z "${SLACK_BOT_TOKEN:-}" ]]; then
+  echo "⚠️  Slack channel configured but SLACK_BOT_TOKEN not set — skipping Slack post" >&2
+fi
+
 echo "✅ Executive Brief completed for $(echo "$all_briefs" | grep -c '═══.*EXECUTIVE BRIEF' || echo 0) customer(s)" >&2
