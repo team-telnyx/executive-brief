@@ -331,8 +331,8 @@ EOF
   if [[ -z "$revenue_data" ]]; then
     echo "  📈 Fetching revenue from Billing A2A (fallback)..." >&2
     # Split revenue into simple queries
-    rev_q1=$(a2a_query "rev-${org_id}-q1" "What was the total monthly spend for org ${org_id} for each of the last 3 months?")
-    rev_q2=$(a2a_query "rev-${org_id}-q2" "What are the top 5 services by spend for org ${org_id} this month?")
+    rev_q1=$(a2a_query "What was the total monthly spend for org ${org_id} for each of the last 3 months?")
+    rev_q2=$(a2a_query "What are the top 5 services by spend for org ${org_id} this month?")
     revenue_data="${rev_q1}
 ---
 ${rev_q2}"
