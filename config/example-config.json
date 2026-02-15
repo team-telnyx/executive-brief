@@ -1,0 +1,38 @@
+{
+  "customers": [
+    {
+      "name": "Acme Corp",
+      "org_id": "00000000-0000-0000-0000-000000000001",
+      "tableau_name": "Acme Corp",
+      "zendesk_org": "acme-corp"
+    },
+    {
+      "name": "Globex Industries",
+      "org_id": "00000000-0000-0000-0000-000000000002",
+      "tableau_name": "Globex Industries",
+      "zendesk_org": "globex-industries"
+    }
+  ],
+  "tableau": {
+    "server": "tableau.yourcompany.com",
+    "site": "YourSite",
+    "api_version": "3.24",
+    "pat_name": "your-pat-name",
+    "revenue_view_id": "your-view-id-here"
+  },
+  "zendesk": {
+    "subdomain": "yourcompany",
+    "email": "you@yourcompany.com"
+  },
+  "a2a": {
+    "billing_url": "http://revenue-agents.query.prod.telnyx.io:8000/a2a/billing-account/rpc"
+  },
+  "output": {
+    "format": "text",
+    "sections": ["tldr", "revenue", "support", "risks", "opportunities", "actions"],
+    "default_days": 90
+  },
+  "slack": {
+    "channel": "C000000BRIEF"
+  }
+}

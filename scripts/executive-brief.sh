@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# Executive Brief — pulls data from Tableau, Zendesk, and Billing A2A
+# to generate C-suite ready account narratives.
+# Output: formatted brief to stdout (or file with --output)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# --- Defaults ---
+CONFIG_PATH="${CONFIG_PATH:-./config/config.json}"
+DRY_RUN="${DRY_RUN:-false}"
+OUTPUT_FILE=""
+CUSTOMER_FILTER=""
+DAYS=""
+SECTIONS_FILTER=""
+
+# --- Flags ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --customer)  CUSTOMER_FILTER="$2"; shift 2 ;;
+    --days)      DAYS="$2"; shift 2 ;;
+    --output)    OUTPUT_FILE="$2"; shift 2 ;;
+    --dry-run)   DRY_RUN="true"; shift ;;
+    --sections)  SECTIONS_FILTER="$2"; shift 2 ;;
+    *)           echo "Unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
+# --- Dependency checks ---
+for cmd in jq curl; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "ERROR: $cmd is required. Install with: brew install $cmd" >&2
+    exit 1
+  fi
+done
+
+# --- Config validation ---
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  echo "ERROR: Config file not found at $CONFIG_PATH" >&2
+  echo "Copy config/example-config.json to config/config.json and fill in your data." >&2
+  exit 1
+fi
+
+if ! jq empty "$CONFIG_PATH" 2>/dev/null; then
+  echo "ERROR: $CONFIG_PATH is not valid JSON" >&2
+  exit 1
+fi
+
+missing_fields=()
+if [[ "$(jq 'has("customers") and (.customers | type == "array")' "$CONFIG_PATH")" != "true" ]]; then
+  missing_fields+=("customers (array)")
+fi
+if [[ "$(jq 'has("tableau")' "$CONFIG_PATH")" != "true" ]]; then
+  missing_fields+=("tableau")
+fi
+if [[ "$(jq 'has("zendesk")' "$CONFIG_PATH")" != "true" ]]; then
+  missing_fields+=("zendesk")
+fi
+if [[ ${#missing_fields[@]} -gt 0 ]]; then
+  echo "ERROR: Config missing required fields: ${missing_fields[*]}" >&2
+  exit 1
+fi
+
+# --- Read config ---
+TABLEAU_SERVER=$(jq -r '.tableau.server' "$CONFIG_PATH")
+TABLEAU_SITE=$(jq -r '.tableau.site' "$CONFIG_PATH")
+TABLEAU_API=$(jq -r '.tableau.api_version // "3.24"' "$CONFIG_PATH")
+TABLEAU_PAT_NAME=$(jq -r '.tableau.pat_name' "$CONFIG_PATH")
+TABLEAU_PAT_SECRET="${TABLEAU_PAT_SECRET:-}"
+TABLEAU_VIEW_ID=$(jq -r '.tableau.revenue_view_id' "$CONFIG_PATH")
+
+ZD_SUBDOMAIN=$(jq -r '.zendesk.subdomain' "$CONFIG_PATH")
+ZD_EMAIL=$(jq -r '.zendesk.email' "$CONFIG_PATH")
+ZD_TOKEN="${ZENDESK_API_TOKEN:-}"
+
+A2A_URL=$(jq -r '.a2a.billing_url // empty' "$CONFIG_PATH" 2>/dev/null || true)
+A2A_URL="${A2A_URL:-http://revenue-agents.query.prod.telnyx.io:8000/a2a/billing-account/rpc}"
+
+DEFAULT_DAYS=$(jq -r '.output.default_days // 90' "$CONFIG_PATH")
+DAYS="${DAYS:-$DEFAULT_DAYS}"
+OUTPUT_FORMAT=$(jq -r '.output.format // "text"' "$CONFIG_PATH")
+
+# Sections to include
+if [[ -n "$SECTIONS_FILTER" ]]; then
+  SECTIONS="$SECTIONS_FILTER"
+else
+  SECTIONS=$(jq -r '.output.sections // ["tldr","revenue","support","risks","opportunities","actions"] | join(",")' "$CONFIG_PATH")
+fi
+
+CUSTOMER_COUNT=$(jq '.customers | length' "$CONFIG_PATH")
+
+echo "📊 Executive Brief Generator" >&2
+echo "   Config: $CONFIG_PATH ($CUSTOMER_COUNT customers)" >&2
+echo "   Days: $DAYS | Sections: $SECTIONS | Format: $OUTPUT_FORMAT" >&2
+[[ "$DRY_RUN" == "true" ]] && echo "   🧪 DRY RUN MODE — no external calls" >&2
+echo "" >&2
+
+# --- Retry wrapper ---
+retry_curl() {
+  local attempt=1 max=3 delay=2
+  while true; do
+    local http_code output
+    output=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" "$@" 2>/dev/null) || true
+    http_code=$(echo "$output" | tail -1)
+    body=$(echo "$output" | sed '$d')
+    if [[ "$http_code" =~ ^2 ]]; then
+      echo "$body"
+      return 0
+    fi
+    if [[ $attempt -ge $max ]]; then
+      echo "$body"
+      return 1
+    fi
+    echo "  Retry $attempt/$max after ${delay}s (HTTP $http_code)..." >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+    attempt=$((attempt + 1))
+  done
+}
+
+# --- Tableau auth ---
+TABLEAU_TOKEN=""
+TABLEAU_SITE_ID=""
+
+tableau_auth() {
+  if [[ -z "$TABLEAU_PAT_SECRET" || -z "$TABLEAU_PAT_NAME" || "$TABLEAU_PAT_NAME" == "null" ]]; then
+    echo "  ⚠️  Tableau PAT not configured, will use A2A fallback" >&2
+    return 1
+  fi
+  local payload
+  payload=$(jq -n \
+    --arg name "$TABLEAU_PAT_NAME" \
+    --arg secret "$TABLEAU_PAT_SECRET" \
+    --arg site "$TABLEAU_SITE" \
+    '{credentials: {personalAccessTokenName: $name, personalAccessTokenSecret: $secret, site: {contentUrl: $site}}}')
+
+  local response
+  response=$(retry_curl -X POST \
+    "https://${TABLEAU_SERVER}/api/${TABLEAU_API}/auth/signin" \
+    -H "Content-Type: application/json" \
+    -d "$payload") || { echo "  ⚠️  Tableau auth failed" >&2; return 1; }
+
+  TABLEAU_TOKEN=$(echo "$response" | jq -r '.credentials.token // empty' 2>/dev/null)
+  TABLEAU_SITE_ID=$(echo "$response" | jq -r '.credentials.site.id // empty' 2>/dev/null)
+
+  if [[ -z "$TABLEAU_TOKEN" ]]; then
+    echo "  ⚠️  Tableau auth returned no token" >&2
+    return 1
+  fi
+  echo "  ✅ Tableau authenticated" >&2
+  return 0
+}
+
+# --- Fetch revenue from Tableau ---
+fetch_tableau_revenue() {
+  local customer_name="$1"
+  local encoded_name
+  encoded_name=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$customer_name'))" 2>/dev/null || echo "$customer_name")
+
+  local response
+  response=$(retry_curl \
+    "https://${TABLEAU_SERVER}/api/${TABLEAU_API}/sites/${TABLEAU_SITE_ID}/views/${TABLEAU_VIEW_ID}/data?vf_Account+Name=${encoded_name}" \
+    -H "X-Tableau-Auth: ${TABLEAU_TOKEN}") || return 1
+
+  echo "$response"
+}
+
+# --- Fetch data from Billing A2A ---
+a2a_query() {
+  local query="$1"
+  local msg_id="exec-brief-$(date +%s)-$RANDOM"
+
+  local payload
+  payload=$(jq -n \
+    --arg mid "$msg_id" \
+    --arg query "$query" \
+    '{
+      jsonrpc: "2.0",
+      id: $mid,
+      method: "message/send",
+      params: {
+        message: {
+          messageId: $mid,
+          role: "user",
+          parts: [{ kind: "text", text: $query }]
+        }
+      }
+    }')
+
+  local response
+  response=$(retry_curl -X POST "$A2A_URL" \
+    -H "Content-Type: application/json" \
+    -d "$payload") || { echo ""; return 1; }
+
+  echo "$response" | jq -r '
+    .result.artifacts[0].parts[0].text //
+    .result.message.parts[0].text //
+    .result.parts[0].text //
+    empty' 2>/dev/null || echo ""
+}
+
+# --- Fetch Zendesk tickets ---
+fetch_zendesk_tickets() {
+  local org="$1"
+  local days="$2"
+  local since_date
+  since_date=$(date -v-${days}d +%Y-%m-%d 2>/dev/null || date -d "${days} days ago" +%Y-%m-%d 2>/dev/null || echo "")
+
+  if [[ -z "$ZD_TOKEN" || -z "$ZD_EMAIL" || "$ZD_EMAIL" == "null" ]]; then
+    echo ""
+    return 1
+  fi
+
+  local response
+  response=$(retry_curl -u "${ZD_EMAIL}/token:${ZD_TOKEN}" \
+    "https://${ZD_SUBDOMAIN}.zendesk.com/api/v2/search.json?query=type:ticket+organization:${org}+created>${since_date}") || { echo ""; return 1; }
+
+  echo "$response"
+}
+
+# --- Process each customer ---
+all_briefs=""
+
+# Authenticate Tableau once
+TABLEAU_AVAILABLE=false
+if [[ "$DRY_RUN" != "true" ]]; then
+  tableau_auth && TABLEAU_AVAILABLE=true
+fi
+
+for i in $(seq 0 $((CUSTOMER_COUNT - 1))); do
+  name=$(jq -r ".customers[$i].name" "$CONFIG_PATH")
+  org_id=$(jq -r ".customers[$i].org_id" "$CONFIG_PATH")
+  tableau_name=$(jq -r ".customers[$i].tableau_name // .customers[$i].name" "$CONFIG_PATH")
+  zendesk_org=$(jq -r ".customers[$i].zendesk_org // empty" "$CONFIG_PATH")
+
+  # Filter by customer name if specified
+  if [[ -n "$CUSTOMER_FILTER" && "$name" != "$CUSTOMER_FILTER" ]]; then
+    continue
+  fi
+
+  echo "━━━ Processing: $name ($org_id) ━━━" >&2
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "  🧪 Dry run — skipping data fetch for $name" >&2
+    cat <<EOF
+
+════════════════════════════════════════════════════════════════
+  EXECUTIVE BRIEF: $name
+  Generated: $(date +"%Y-%m-%d %H:%M %Z") (DRY RUN)
+  Period: Last $DAYS days
+════════════════════════════════════════════════════════════════
+
+  [DRY RUN] No data fetched. Would query:
+  - Tableau revenue for "$tableau_name"
+  - Zendesk tickets for "$zendesk_org" (last $DAYS days)
+  - Billing A2A for org $org_id (balance, MRC, credit)
+
+  Sections: $SECTIONS
+
+EOF
+    continue
+  fi
+
+  # --- Collect data ---
+  revenue_data=""
+  revenue_source=""
+
+  # 1. Try Tableau first
+  if [[ "$TABLEAU_AVAILABLE" == "true" ]]; then
+    echo "  📈 Fetching revenue from Tableau..." >&2
+    revenue_data=$(fetch_tableau_revenue "$tableau_name" 2>/dev/null || echo "")
+    if [[ -n "$revenue_data" ]]; then
+      revenue_source="Tableau"
+      echo "  ✅ Tableau revenue data received" >&2
+    fi
+  fi
+
+  # 2. Fallback to A2A for revenue
+  if [[ -z "$revenue_data" ]]; then
+    echo "  📈 Fetching revenue from Billing A2A (fallback)..." >&2
+    revenue_data=$(a2a_query "For org $org_id, provide monthly revenue for the last 6 months broken down by product/service. Include totals, MoM changes, and service-level breakdown. Return as JSON.")
+    revenue_source="Billing A2A"
+    if [[ -n "$revenue_data" ]]; then
+      echo "  ✅ A2A revenue data received" >&2
+    else
+      echo "  ⚠️  No revenue data available" >&2
+    fi
+  fi
+
+  # 3. Zendesk tickets
+  ticket_data=""
+  if [[ -n "$zendesk_org" && "$zendesk_org" != "null" ]]; then
+    echo "  🎫 Fetching Zendesk tickets (last $DAYS days)..." >&2
+    ticket_data=$(fetch_zendesk_tickets "$zendesk_org" "$DAYS" 2>/dev/null || echo "")
+    if [[ -n "$ticket_data" ]]; then
+      echo "  ✅ Zendesk ticket data received" >&2
+    else
+      echo "  ⚠️  No Zendesk data available" >&2
+    fi
+  fi
+
+  # 4. Billing A2A for balance/credit/MRC
+  echo "  💰 Fetching billing summary from A2A..." >&2
+  billing_data=$(a2a_query "For org $org_id, provide: current_balance, credit_limit, current_month_usage, next_month_mrc, daily_run_rate, has_autorecharge_enabled, payment_method, contract_end_date. Return as JSON.")
+  if [[ -n "$billing_data" ]]; then
+    echo "  ✅ Billing data received" >&2
+  else
+    echo "  ⚠️  No billing data available" >&2
+  fi
+
+  # 5. Build data JSON for narrative generator
+  data_json=$(jq -n \
+    --arg name "$name" \
+    --arg org_id "$org_id" \
+    --arg days "$DAYS" \
+    --arg sections "$SECTIONS" \
+    --arg revenue_source "$revenue_source" \
+    --arg revenue_data "$revenue_data" \
+    --arg ticket_data "$ticket_data" \
+    --arg billing_data "$billing_data" \
+    --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{
+      customer: $name,
+      org_id: $org_id,
+      period_days: ($days | tonumber),
+      sections: ($sections | split(",")),
+      timestamp: $timestamp,
+      data: {
+        revenue: { source: $revenue_source, raw: $revenue_data },
+        tickets: { raw: $ticket_data },
+        billing: { raw: $billing_data }
+      }
+    }')
+
+  # 6. Generate narrative
+  echo "  📝 Generating narrative..." >&2
+  brief=$(echo "$data_json" | bash "$SCRIPT_DIR/generate-narrative.sh")
+
+  all_briefs="${all_briefs}${brief}\n"
+  echo "  ✅ Brief generated for $name" >&2
+done
+
+# --- Output ---
+output_text=$(echo -e "$all_briefs")
+
+if [[ -n "$OUTPUT_FILE" ]]; then
+  echo "$output_text" > "$OUTPUT_FILE"
+  echo "📁 Brief saved to $OUTPUT_FILE" >&2
+fi
+
+echo "$output_text"
+echo "✅ Executive Brief completed for $(echo "$all_briefs" | grep -c '═══.*EXECUTIVE BRIEF' || echo 0) customer(s)" >&2
