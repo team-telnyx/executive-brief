@@ -1,0 +1,30 @@
+{
+  "customers": [
+    {
+      "name": "Ringba",
+      "org_id": "7cb68c48-01e3-4a97-b3a6-0097a594cacd",
+      "tableau_name": "Ringba",
+      "zendesk_org": "Ringba"
+    }
+  ],
+  "tableau": {
+    "server": "https://prod-apnortheast-a.online.tableau.com",
+    "site": "jain-48c99e992f",
+    "site_id": "4be1dfc7-e657-4554-9ea5-f58de504474a",
+    "pat_name": "CallingDrew",
+    "views": {
+      "monthly": "b6d611f1-23eb-4c1e-bb63-ad430ca704f5",
+      "daily": "e93ab4ee-4ae8-49a5-8bc4-6974ae6ec2d1"
+    }
+  },
+  "zendesk": {
+    "subdomain": "telnyx",
+    "email": "success@telnyx.com"
+  },
+  "a2a": {
+    "billing_url": "http://revenue-agents.query.prod.telnyx.io:8000/a2a/billing-account/rpc"
+  },
+  "output": {
+    "sections": ["revenue", "support", "billing", "risks", "opportunities", "actions"]
+  }
+}

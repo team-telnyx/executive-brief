@@ -62,7 +62,7 @@ if [[ ${#missing_fields[@]} -gt 0 ]]; then
 fi
 
 # --- Read config ---
-TABLEAU_SERVER=$(jq -r '.tableau.server' "$CONFIG_PATH")
+TABLEAU_SERVER=$(jq -r '.tableau.server // ""' "$CONFIG_PATH" | sed 's|^https://||')
 TABLEAU_SITE=$(jq -r '.tableau.site' "$CONFIG_PATH")
 TABLEAU_API=$(jq -r '.tableau.api_version // "3.24"' "$CONFIG_PATH")
 TABLEAU_PAT_NAME=$(jq -r '.tableau.pat_name' "$CONFIG_PATH")
@@ -127,19 +127,12 @@ extract_bool() {
 retry_curl() {
   local attempt=1 max=3 delay=2
   while true; do
-    local http_code output
-    output=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" "$@" 2>/dev/null) || true
-    http_code=$(echo "$output" | tail -1)
-    body=$(echo "$output" | sed '$d')
-    if [[ "$http_code" =~ ^2 ]]; then
-      echo "$body"
-      return 0
-    fi
+    local output
+    output=$(curl --connect-timeout 10 --max-time 30 -s "$@" 2>/dev/null) && { echo "$output"; return 0; }
     if [[ $attempt -ge $max ]]; then
-      echo "$body"
-      return 1
+      echo '{"error":"request_failed"}'; return 1
     fi
-    echo "  Retry $attempt/$max after ${delay}s (HTTP $http_code)..." >&2
+    echo "  Retry $attempt/$max after ${delay}s..." >&2
     sleep "$delay"
     delay=$((delay * 2))
     attempt=$((attempt + 1))
