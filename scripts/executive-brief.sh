@@ -330,7 +330,12 @@ EOF
   # 2. Fallback to A2A for revenue
   if [[ -z "$revenue_data" ]]; then
     echo "  📈 Fetching revenue from Billing A2A (fallback)..." >&2
-    revenue_data=$(a2a_query "For org $org_id, provide monthly revenue for the last 6 months broken down by product/service. Include totals, MoM changes, and service-level breakdown. Return as JSON.")
+    # Split revenue into simple queries
+    rev_q1=$(a2a_query "rev-${org_id}-q1" "What was the total monthly spend for org ${org_id} for each of the last 3 months?")
+    rev_q2=$(a2a_query "rev-${org_id}-q2" "What are the top 5 services by spend for org ${org_id} this month?")
+    revenue_data="${rev_q1}
+---
+${rev_q2}"
     revenue_source="Billing A2A"
     if [[ -n "$revenue_data" ]]; then
       echo "  ✅ A2A revenue data received" >&2
